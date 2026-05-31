@@ -1,4 +1,4 @@
-# PDF-DarkMod - Offline Desktop Converter
+# PDF-DarkMod - Offline Desktop PDF Dark Mode Converter
 
 A standalone desktop application that converts your PDF files into beautiful, eye-friendly dark mode themes. 
 Built entirely with Python and Tkinter, ensuring 100% privacy with complete offline processing—no Node.js, Electron, or cloud uploads required.
