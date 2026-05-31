@@ -1,0 +1,758 @@
+"""
+PDF Dark Mode Converter
+-----------------------
+Standalone desktop app. No Node, no Rust, no Electron.
+Requires: pip install pymupdf
+
+Run:  python converter.py
+Build: pyinstaller --onefile --windowed --name "PDF-Dark-Converter" converter.py
+"""
+
+import fitz  # PyMuPDF
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from pathlib import Path
+import platform
+import ctypes
+import sys
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
+# ── HiDPI / display-scaling awareness (Windows only) ───────────────────────────
+# Must be called before any Tk window is created.
+if sys.platform == "win32":
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()   # fallback for older Windows
+        except Exception:
+            pass
+
+
+# ── Theme definitions ──────────────────────────────────────────────────────────
+# Each value is the (R, G, B) background color.
+# The pixel algorithm maps brightness → this bg color (dark) to white (bright).
+THEMES = {
+    "Classic Inversion": (0,   0,   0),
+    "Claude Warm":       (42,  37,  34),
+    "ChatGPT Cool":      (52,  53,  65),
+    "Sepia Dark":        (40,  35,  25),
+    "Midnight Blue":     (25,  30,  45),
+    "Forest Green":      (25,  35,  30),
+}
+
+
+# ── PDF processing ─────────────────────────────────────────────────────────────
+
+def process_page(page: fitz.Page, dpi: int, bg: tuple = (42, 37, 34)) -> None:
+    """
+    Convert a single page to dark mode.
+
+    bg: (R, G, B) background color. Dark pixels map to bg, bright pixels
+        map toward (255, 255, 255). Uses the original web-app luminance formula.
+    Uses NumPy vectorized operations for ~15-20x speedup over Python pixel loops,
+    with a pure-Python bytearray fallback if NumPy is not available.
+    """
+    BG_R, BG_G, BG_B = bg
+
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csRGB)
+
+    if HAS_NUMPY:
+        # Load pixels into NumPy array — shape (height, width, 3), dtype uint8
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3).copy()
+
+        r = arr[:, :, 0].astype(np.float32)
+        g = arr[:, :, 1].astype(np.float32)
+        b = arr[:, :, 2].astype(np.float32)
+
+        brightness = 0.299 * r + 0.587 * g + 0.114 * b
+        factor = 1.0 - (brightness / 255.0)
+
+        arr[:, :, 0] = np.clip(BG_R + (255 - BG_R) * factor, 0, 255).astype(np.uint8)
+        arr[:, :, 1] = np.clip(BG_G + (255 - BG_G) * factor, 0, 255).astype(np.uint8)
+        arr[:, :, 2] = np.clip(BG_B + (255 - BG_B) * factor, 0, 255).astype(np.uint8)
+
+        new_pix = fitz.Pixmap(fitz.csRGB, pix.width, pix.height, arr.tobytes(), False)
+    else:
+        # Pure-Python bytearray fallback
+        samples = bytearray(pix.samples)
+        for i in range(0, len(samples), 3):
+            r, g, b = samples[i], samples[i+1], samples[i+2]
+            brightness = 0.299 * r + 0.587 * g + 0.114 * b
+            factor = 1.0 - (brightness / 255.0)
+            samples[i] = int(min(255, max(0, BG_R + (255 - BG_R) * factor)))
+            samples[i+1] = int(min(255, max(0, BG_G + (255 - BG_G) * factor)))
+            samples[i+2] = int(min(255, max(0, BG_B + (255 - BG_B) * factor)))
+
+        new_pix = fitz.Pixmap(fitz.csRGB, pix.width, pix.height, bytes(samples), False)
+
+    page.clean_contents()
+    page.insert_image(page.rect, pixmap=new_pix, keep_proportion=False)
+
+
+def convert_pdf(
+    input_path: Path,
+    output_path: Path,
+    theme_name: str,
+    dpi: int,
+    preserve_text: bool,
+    progress_cb,
+    done_cb,
+    error_cb,
+) -> None:
+    import time
+    import traceback
+    import tempfile
+    import shutil
+    from collections import deque
+
+    try:
+        # Guard: never overwrite the source file
+        if Path(input_path).resolve() == Path(output_path).resolve():
+            raise ValueError("Output path must be different from input path.")
+
+        doc      = fitz.open(str(input_path))
+        bg_color = THEMES.get(theme_name, (42, 37, 34))
+        total    = doc.page_count
+
+        toc      = doc.get_toc(simple=False)
+        metadata = doc.metadata.copy()
+
+        page_times = deque(maxlen=10)
+
+        for i, page in enumerate(doc):
+            t0 = time.perf_counter()
+            process_page(page, dpi=dpi, bg=bg_color)
+
+            page_times.append(time.perf_counter() - t0)
+            avg = sum(page_times) / len(page_times)
+            remaining = avg * (total - i - 1)
+            progress_cb(i + 1, total, remaining)
+
+        if toc:
+            fixed_toc = []
+            for entry in toc:
+                level    = entry[0]
+                title    = entry[1]
+                page_num = entry[2]
+                # Clamp to valid 1-indexed page range
+                page_num = max(1, min(page_num, doc.page_count))
+                fixed_dest = {
+                    "kind": 1,             # fitz.LINK_GOTO — page-number destination
+                    "page": page_num - 1,  # 0-indexed internally
+                    "to":   fitz.Point(0, 0),
+                    "zoom": 0,
+                }
+                fixed_toc.append([level, title, page_num, fixed_dest])
+            doc.set_toc(fixed_toc)
+        doc.set_metadata(metadata)
+
+        # Save to a temp file first, then atomically replace the output
+        # This prevents corruption if output_path already exists
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        doc.save(
+            tmp_path,
+            garbage=4,
+            deflate=True,
+            deflate_images=True,
+            clean=True,
+        )
+        doc.close()
+        shutil.move(tmp_path, str(output_path))
+
+        done_cb(len(toc), total)
+
+    except Exception:
+        error_cb(traceback.format_exc())
+    finally:
+        # doc.close() is safe to call multiple times; guard against undefined
+        if 'doc' in locals():
+            try:
+                doc.close()
+            except Exception:
+                pass
+
+
+# ── GUI ────────────────────────────────────────────────────────────────────────
+
+C = {
+    "bg":         "#0d0f14",
+    "panel":      "#0a0c10",
+    "surface":    "#13151c",
+    "border":     "#2e3140",   # brighter (was #1e2028)
+    "border2":    "#3a3e52",   # brighter (was #2a2d3a)
+    "accent":     "#1e4ed8",
+    "accent_dim": "#162ea0",
+    "text":       "#e8eaf0",
+    "text2":      "#c4c8d8",   # brighter (was #a0a8c0)
+    "muted":      "#8a90a8",   # MUCH brighter (was #4a4e5c)
+    "muted2":     "#6b7185",   # brighter (was #3d4155)
+    "divider":    "#252730",   # slightly visible (was #1a1c24)
+}
+
+# Modern font stack — Segoe UI ships with Windows 10/11 and renders crisply
+if platform.system() == "Darwin":
+    _ui_font   = "SF Pro Display"
+    _mono_font = "SF Mono"
+elif platform.system() == "Windows":
+    _ui_font   = "Segoe UI"
+    _mono_font = "Consolas"
+else:
+    _ui_font   = "DejaVu Sans"
+    _mono_font = "DejaVu Sans Mono"
+
+FONT_MONO  = (_mono_font, 9)          # used only for file path entries
+FONT_LABEL = (_ui_font,   9)
+FONT_TITLE = (_ui_font,   17, "bold")
+FONT_BTN   = (_ui_font,   10, "bold")
+FONT_SMALL = (_ui_font,   8)
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("PDF-DarkMod")
+        self.geometry("1060x620")
+        self.minsize(920, 560)
+        self.configure(bg=C["bg"])
+        self.resizable(True, True)
+
+        # Match Tkinter's internal scaling to the actual display DPI
+        try:
+            dpi = self.winfo_fpixels("1i")  # pixels per inch
+            self.tk.call("tk", "scaling", dpi / 72.0)
+        except Exception:
+            pass
+        
+        # Windows 11 Taskbar Icon + Dark Titlebar Support
+        if sys.platform == "win32":
+            try:
+                # 1. Force Windows to use our icon for the taskbar (avoids default python icon)
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("pdfdarkmod.converter.v2")
+                
+                # 2. Set dark titlebar
+                self.update_idletasks() # Ensure window is created
+                hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+                value = ctypes.c_int(2) # 2 = Dark mode
+                # DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(value), ctypes.sizeof(value))
+            except Exception:
+                pass
+
+        try:
+            import os
+            # Resolve absolute path for icon to ensure it loads
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "favicon.ico")
+            self.iconbitmap(icon_path)
+        except Exception:
+            pass
+
+        self._input_path: Path | None = None
+        self._converting = False
+        
+        self._input_var = tk.StringVar()
+        self._output_var = tk.StringVar()
+        self._theme_var = tk.StringVar(value="ChatGPT Cool")
+        self._dpi_var = tk.StringVar(value="150 — Balanced")
+        self._preserve_var = tk.BooleanVar(value=False)
+        self._progress_var = tk.IntVar(value=0)
+
+        self._preview_page_index = 0   # 0-based page index currently shown in preview
+        self._preview_total_pages = 0  # set when a PDF is loaded
+
+        # Triggers for preview
+        self._input_var.trace_add("write", lambda *_: (
+            setattr(self, '_preview_page_index', 0),
+            self._page_entry_var.set("1") if hasattr(self, '_page_entry_var') else None,
+            self._render_preview(self._theme_var.get(), page_index=0)
+        ))
+        self._theme_var.trace_add("write", lambda *_: self._render_preview(self._theme_var.get()))
+
+        self._build_ui()
+
+    def _make_field(self, parent, label_text: str, textvariable, btn_text: str, btn_cmd) -> tk.Frame:
+        frame = tk.Frame(parent, bg=C["bg"])
+        
+        tk.Label(frame, text=label_text, font=FONT_LABEL,
+                 bg=C["bg"], fg=C["muted"]).pack(anchor="w", pady=(0, 5))
+        
+        row = tk.Frame(frame, bg=C["bg"])
+        row.pack(fill=tk.X)
+        
+        entry = tk.Entry(row, textvariable=textvariable,
+                         font=FONT_MONO, bg=C["surface"], fg=C["text2"],
+                         insertbackground=C["text2"], relief="flat",
+                         highlightthickness=1, highlightbackground=C["border"],
+                         highlightcolor=C["accent"])
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6)
+        
+        btn = tk.Button(row, text=btn_text, command=btn_cmd,
+                        font=FONT_LABEL, bg=C["surface"], fg=C["text2"],
+                        activebackground=C["border2"], activeforeground=C["text"],
+                        relief="flat", padx=10, cursor="hand2",
+                        highlightthickness=1, highlightbackground=C["border"])
+        btn.pack(side=tk.LEFT, padx=(6, 0), ipady=6)
+        
+        return frame
+
+    def _make_dropdown(self, parent, variable: tk.StringVar, options: list, width: int = 18):
+        """Custom dark-themed dropdown replacing tk.OptionMenu."""
+        container = tk.Frame(parent, bg=C["surface"],
+                             highlightthickness=1, highlightbackground=C["border"])
+
+        btn = tk.Button(
+            container,
+            textvariable=variable,
+            font=FONT_LABEL,
+            bg=C["surface"], fg=C["text2"],
+            activebackground=C["border2"], activeforeground=C["text"],
+            relief="flat", anchor="w", padx=10, pady=7,
+            cursor="hand2", bd=0,
+            width=width,
+        )
+        btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        arrow = tk.Label(
+            container, text="▾",
+            font=(FONT_LABEL[0], 10),
+            bg=C["surface"], fg=C["muted"],
+            padx=6, pady=7, cursor="hand2",
+        )
+        arrow.pack(side=tk.RIGHT)
+
+        menu = tk.Menu(
+            self, tearoff=0,
+            bg=C["surface"], fg=C["text2"],
+            activebackground=C["accent"], activeforeground="#ffffff",
+            font=FONT_LABEL,
+            relief="flat", bd=1,
+            activeborderwidth=0,
+        )
+
+        def _set(val):
+            variable.set(val)
+
+        for opt in options:
+            menu.add_command(label=opt, command=lambda v=opt: _set(v))
+
+        def _open_menu(event=None):
+            x = container.winfo_rootx()
+            y = container.winfo_rooty() + container.winfo_height()
+            menu.tk_popup(x, y)
+
+        btn.configure(command=_open_menu)
+        arrow.bind("<Button-1>", _open_menu)
+        container.bind("<Button-1>", _open_menu)
+
+        return container
+
+    def _build_ui(self):
+        left_pane  = tk.Frame(self, bg=C["bg"], width=340)
+        right_pane = tk.Frame(self, bg=C["panel"])
+        left_pane.pack(side=tk.LEFT, fill=tk.Y, padx=0, pady=0)
+        left_pane.pack_propagate(False)
+        right_pane.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        SIDE_PAD = 24
+
+        # --- LEFT PANEL ---
+        title_frame = tk.Frame(left_pane, bg=C["bg"])
+        title_frame.pack(fill=tk.X, padx=SIDE_PAD, pady=(22, 0))
+
+        tk.Label(title_frame, text="PDF-DarkMod", font=FONT_TITLE,
+                 bg=C["bg"], fg=C["text"]).pack(side=tk.LEFT)
+
+        tk.Label(left_pane, text="Offline Converter",
+                 font=FONT_SMALL, bg=C["bg"], fg=C["muted"]
+                 ).pack(anchor="w", padx=SIDE_PAD, pady=(2, 20))
+
+        # File inputs
+        self._make_field(left_pane, "INPUT PDF", self._input_var, "Browse", self._browse_input).pack(
+            fill=tk.X, padx=SIDE_PAD, pady=(0, 14))
+        self._make_field(left_pane, "OUTPUT PDF", self._output_var, "Change", self._browse_output).pack(
+            fill=tk.X, padx=SIDE_PAD, pady=(0, 14))
+
+        # Thin divider
+        tk.Frame(left_pane, bg=C["divider"], height=1).pack(
+            fill=tk.X, padx=SIDE_PAD, pady=(6, 16))
+
+        # Theme
+        theme_block = tk.Frame(left_pane, bg=C["bg"])
+        theme_block.pack(fill=tk.X, padx=SIDE_PAD, pady=(0, 14))
+        tk.Label(theme_block, text="THEME", font=FONT_LABEL,
+                 bg=C["bg"], fg=C["muted"]).pack(anchor="w", pady=(0, 5))
+
+        self._make_dropdown(theme_block, self._theme_var, list(THEMES.keys()), width=16).pack(fill=tk.X)
+
+        # Quality
+        dpi_block = tk.Frame(left_pane, bg=C["bg"])
+        dpi_block.pack(fill=tk.X, padx=SIDE_PAD, pady=(0, 16))
+        tk.Label(dpi_block, text="QUALITY", font=FONT_LABEL,
+                 bg=C["bg"], fg=C["muted"]).pack(anchor="w", pady=(0, 5))
+
+        self._make_dropdown(dpi_block, self._dpi_var,
+                            ["96 — Fast", "150 — Balanced", "300 — High Quality"],
+                            width=16).pack(fill=tk.X)
+
+        # Spacer pushes button to bottom
+        tk.Frame(left_pane, bg=C["bg"]).pack(fill=tk.BOTH, expand=True)
+
+        # Convert button
+        self._convert_btn = tk.Button(
+            left_pane,
+            text="Convert to Dark Mode",
+            command=self._start_conversion,
+            font=FONT_BTN,
+            bg=C["accent"], fg="#c8d8ff",
+            activebackground=C["accent_dim"], activeforeground="#c8d8ff",
+            relief="flat", cursor="hand2",
+            pady=10
+        )
+        self._convert_btn.pack(fill=tk.X, padx=SIDE_PAD, pady=(0, 10))
+
+        # Progress area
+        prog_frame = tk.Frame(left_pane, bg=C["bg"])
+        prog_frame.pack(fill=tk.X, padx=SIDE_PAD, pady=(0, 18))
+
+        style = ttk.Style()
+        try:
+            style.theme_use("default")
+        except Exception:
+            pass
+            
+        style.configure("Thin.Horizontal.TProgressbar",
+                        troughcolor=C["divider"],
+                        background=C["accent"],
+                        thickness=2,
+                        borderwidth=0)
+
+        self._progress = ttk.Progressbar(prog_frame, style="Thin.Horizontal.TProgressbar",
+                                          variable=self._progress_var, maximum=100)
+        self._progress.pack(fill=tk.X, pady=(0, 5))
+
+        self._status_label = tk.Label(prog_frame, text="Select a PDF to begin.",
+                                       font=FONT_SMALL, bg=C["bg"], fg=C["muted"],
+                                       anchor="w")
+        self._status_label.pack(fill=tk.X)
+
+
+        # --- RIGHT PANEL ---
+        header = tk.Frame(right_pane, bg=C["panel"], height=36)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+
+        tk.Label(header, text="PREVIEW", font=FONT_LABEL,
+                 bg=C["panel"], fg=C["muted"]).pack(side=tk.LEFT, padx=18, pady=0)
+
+        self._preview_page_badge = tk.Label(header, text="PAGE 1",
+            font=FONT_LABEL, bg=C["border2"], fg=C["text2"],
+            padx=7, pady=2, relief="flat")
+        self._preview_page_badge.pack(side=tk.LEFT, padx=(4, 0))
+
+        # Navigation buttons — right-aligned in header
+        nav_frame = tk.Frame(header, bg=C["panel"])
+        nav_frame.pack(side=tk.RIGHT, padx=12)
+
+        btn_prev = tk.Button(
+            nav_frame, text="◀", command=self._preview_prev,
+            font=FONT_LABEL, bg=C["surface"], fg=C["text2"],
+            activebackground=C["border2"], activeforeground=C["text"],
+            relief="flat", padx=8, pady=2, cursor="hand2",
+            highlightthickness=1, highlightbackground=C["border"]
+        )
+        btn_prev.pack(side=tk.LEFT, padx=(0, 4))
+
+        self._page_entry_var = tk.StringVar(value="1")
+        page_entry = tk.Entry(
+            nav_frame, textvariable=self._page_entry_var,
+            font=FONT_LABEL, bg=C["surface"], fg=C["text2"],
+            insertbackground=C["text2"], relief="flat",
+            highlightthickness=1, highlightbackground=C["border"],
+            width=4, justify="center"
+        )
+        page_entry.pack(side=tk.LEFT)
+        page_entry.bind("<Return>", self._preview_goto)
+
+        btn_next = tk.Button(
+            nav_frame, text="▶", command=self._preview_next,
+            font=FONT_LABEL, bg=C["surface"], fg=C["text2"],
+            activebackground=C["border2"], activeforeground=C["text"],
+            relief="flat", padx=8, pady=2, cursor="hand2",
+            highlightthickness=1, highlightbackground=C["border"]
+        )
+        btn_next.pack(side=tk.LEFT, padx=(4, 0))
+
+        tk.Frame(right_pane, bg=C["divider"], height=1).pack(fill=tk.X)
+
+        preview_area = tk.Frame(right_pane, bg=C["panel"])
+        preview_area.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+        self._preview_label = tk.Label(
+            preview_area,
+            text="Load a PDF to preview",
+            font=FONT_MONO, bg=C["surface"], fg=C["muted"],
+            relief="flat"
+        )
+        self._preview_label.place(relx=0.5, rely=0.5, anchor="center",
+                                   relwidth=0.85, relheight=0.95)
+
+        footer = tk.Frame(right_pane, bg=C["panel"], height=32)
+        footer.pack(fill=tk.X, side=tk.BOTTOM)
+        footer.pack_propagate(False)
+
+        tk.Frame(right_pane, bg=C["divider"], height=1).pack(fill=tk.X, side=tk.BOTTOM)
+
+        tk.Label(footer, text="SWITCH PREVIEW",
+                 font=FONT_LABEL, bg=C["panel"], fg=C["muted"]).pack(side=tk.LEFT, padx=(14, 8))
+
+        THEME_DOTS = {
+            "Classic Inversion": "#000000",
+            "Claude Warm":       "#2a2522",
+            "ChatGPT Cool":      "#343541",
+            "Sepia Dark":        "#282319",
+            "Midnight Blue":     "#191e2d",
+            "Forest Green":      "#19231e",
+        }
+        for theme_name, dot_color in THEME_DOTS.items():
+            dot = tk.Label(footer, bg=dot_color, width=2, relief="flat", cursor="hand2",
+                           highlightthickness=1, highlightbackground=C["border"])
+            dot.pack(side=tk.LEFT, padx=3, pady=6)
+            dot.bind("<Button-1>", lambda e, t=theme_name: self._on_theme_dot(t))
+            dot.bind("<Enter>",    lambda e, d=dot: d.configure(highlightbackground=C["text2"]))
+            dot.bind("<Leave>",    lambda e, d=dot: d.configure(highlightbackground=C["border"]))
+
+
+    def _on_theme_dot(self, theme_name: str) -> None:
+        self._theme_var.set(theme_name)
+
+    def _preview_prev(self):
+        if not self._input_var.get() or self._preview_total_pages == 0:
+            return
+        idx = max(0, self._preview_page_index - 1)
+        self._page_entry_var.set(str(idx + 1))
+        self._render_preview(self._theme_var.get(), page_index=idx)
+
+    def _preview_next(self):
+        if not self._input_var.get() or self._preview_total_pages == 0:
+            return
+        idx = min(self._preview_total_pages - 1, self._preview_page_index + 1)
+        self._page_entry_var.set(str(idx + 1))
+        self._render_preview(self._theme_var.get(), page_index=idx)
+
+    def _preview_goto(self, event=None):
+        if not self._input_var.get() or self._preview_total_pages == 0:
+            return
+        try:
+            n = int(self._page_entry_var.get()) - 1
+            n = max(0, min(n, self._preview_total_pages - 1))
+            self._page_entry_var.set(str(n + 1))
+            self._render_preview(self._theme_var.get(), page_index=n)
+        except ValueError:
+            pass
+
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
+
+    def _parse_dpi(self) -> int:
+        try:
+            return int(self._dpi_var.get().split()[0])
+        except Exception:
+            return 150
+
+    def _fmt_eta(self, s: float) -> str:
+        if s < 5:
+            return ""
+        m, s = divmod(int(s), 60)
+        return f"~{m}m {s}s remaining" if m else f"~{s}s remaining"
+
+
+    # ── File pickers ───────────────────────────────────────────────────────────
+
+    def _browse_input(self):
+        path = filedialog.askopenfilename(
+            title="Select PDF", filetypes=[("PDF files", "*.pdf")])
+        if not path:
+            return
+        self._input_path = Path(path)
+        try:
+            _doc = fitz.open(str(self._input_path))
+            self._preview_total_pages = _doc.page_count
+            _doc.close()
+        except Exception:
+            self._preview_total_pages = 1
+        self._preview_page_index = 0
+        self._input_var.set(str(self._input_path))
+        self._output_var.set(str(
+            self._input_path.parent / f"{self._input_path.stem}-dark.pdf"))
+        self._convert_btn.configure(state="normal")
+        self._status_label.configure(text=f"Ready: {self._input_path.name}")
+
+    def _browse_output(self):
+        path = filedialog.asksaveasfilename(
+            title="Save output as",
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf")],
+            initialfile=self._output_var.get())
+        if path:
+            self._output_var.set(path)
+
+            
+    # ── Preview Rendering ──────────────────────────────────────────────────────
+
+    def _render_preview(self, theme: str, page_index: int = None) -> None:
+        """Render page 1 of the loaded PDF at 72 DPI for preview. Non-blocking.
+        Uses only PyMuPDF + tkinter.PhotoImage — no Pillow required.
+        Applies the same luminance-based pixel algorithm as process_page.
+        """
+        if page_index is None:
+            page_index = self._preview_page_index
+        else:
+            self._preview_page_index = page_index
+        if not self._input_var.get():
+            return
+
+        input_path = Path(self._input_var.get())
+        if not input_path.exists():
+            return
+
+        def _do_render():
+            import base64
+            try:
+                bg = THEMES.get(theme, (42, 37, 34))
+                BG_R, BG_G, BG_B = bg
+
+                doc = fitz.open(str(input_path))
+                page = doc[page_index]
+                mat = fitz.Matrix(1.0, 1.0)  # 72 DPI — screen only
+                pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csRGB)
+                doc.close()
+
+                if HAS_NUMPY:
+                    import numpy as np
+                    # NumPy vectorized transform — same luminance formula as process_page
+                    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3).copy()
+
+                    r = arr[:, :, 0].astype(np.float32)
+                    g = arr[:, :, 1].astype(np.float32)
+                    b = arr[:, :, 2].astype(np.float32)
+
+                    brightness = 0.299 * r + 0.587 * g + 0.114 * b
+                    factor = 1.0 - (brightness / 255.0)
+
+                    arr[:, :, 0] = np.clip(BG_R + (255 - BG_R) * factor, 0, 255).astype(np.uint8)
+                    arr[:, :, 1] = np.clip(BG_G + (255 - BG_G) * factor, 0, 255).astype(np.uint8)
+                    arr[:, :, 2] = np.clip(BG_B + (255 - BG_B) * factor, 0, 255).astype(np.uint8)
+
+                    pix = fitz.Pixmap(fitz.csRGB, pix.width, pix.height, arr.tobytes(), False)
+                else:
+                    # Pure-Python bytearray fallback
+                    samples = bytearray(pix.samples)
+                    for i in range(0, len(samples), 3):
+                        r, g, b = samples[i], samples[i+1], samples[i+2]
+                        brightness = 0.299 * r + 0.587 * g + 0.114 * b
+                        factor = 1.0 - (brightness / 255.0)
+                        samples[i] = int(min(255, max(0, BG_R + (255 - BG_R) * factor)))
+                        samples[i+1] = int(min(255, max(0, BG_G + (255 - BG_G) * factor)))
+                        samples[i+2] = int(min(255, max(0, BG_B + (255 - BG_B) * factor)))
+
+                    pix = fitz.Pixmap(fitz.csRGB, pix.width, pix.height, bytes(samples), False)
+
+                # Encode as PNG → base64 → tk.PhotoImage (no Pillow needed)
+                b64 = base64.b64encode(pix.tobytes("png"))
+                photo = tk.PhotoImage(data=b64)
+
+                factor_sub = max(1, photo.width() // 380)
+                if factor_sub > 1:
+                    photo = photo.subsample(factor_sub, factor_sub)
+
+                self.after(0, lambda p=photo: self._update_preview_image(p))
+                self.after(0, lambda i=page_index, t=self._preview_total_pages:
+                    self._preview_page_badge.configure(
+                        text=f"PAGE {i + 1} / {t}"
+                    )
+                )
+            except Exception as e:
+                msg = str(e)
+                self.after(0, lambda m=msg: self._show_preview_error(m))
+
+        threading.Thread(target=_do_render, daemon=True).start()
+
+    def _update_preview_image(self, photo) -> None:
+        self._preview_photo = photo  # keep reference to prevent GC
+        self._preview_label.configure(image=photo, text="")
+
+    def _show_preview_error(self, msg: str) -> None:
+        self._preview_label.configure(image="", text=f"Preview error:\n{msg}")
+
+
+    # ── Conversion ─────────────────────────────────────────────────────────────
+
+    def _start_conversion(self):
+        if self._converting or not self._input_path:
+            return
+        output_path = Path(self._output_var.get() or str(
+            self._input_path.parent / f"{self._input_path.stem}-dark.pdf"))
+        if not output_path.suffix:
+            output_path = output_path.with_suffix(".pdf")
+
+        self._converting = True
+        self._convert_btn.configure(state="disabled", text="Converting…")
+        self._progress_var.set(0)
+        self._status_label.configure(text="Starting…")
+
+        threading.Thread(
+            target=convert_pdf,
+            args=(self._input_path, output_path, self._theme_var.get(),
+                  self._parse_dpi(),
+                  self._preserve_var.get(),
+                  self._on_progress, self._on_done, self._on_error),
+            daemon=True,
+        ).start()
+
+    # ── Thread-safe callbacks ──────────────────────────────────────────────────
+
+    def _on_progress(self, current: int, total: int, eta: float):
+        pct = int((current / total) * 100)
+        eta_str = self._fmt_eta(eta) if eta > 0 else "Applying text layer..."
+        
+        def _update():
+            self._progress_var.set(pct)
+            self._status_label.configure(text=f"Page {current} of {total}   {eta_str}")
+            
+        self.after(0, _update)
+
+    def _on_done(self, bookmark_count: int, page_count: int):
+        def _finish():
+            self._converting = False
+            self._progress_var.set(100)
+            self._convert_btn.configure(state="normal", text="Convert to Dark Mode")
+            self._status_label.configure(text=f"Done: {page_count} pages, {bookmark_count} bookmarks preserved.")
+            messagebox.showinfo("Done",
+                f"Saved to:\n{self._output_var.get()}\n\n"
+                f"{page_count} pages · "
+                f"{bookmark_count} bookmark{'s' if bookmark_count != 1 else ''} preserved")
+        self.after(0, _finish)
+
+    def _on_error(self, message: str):
+        def _show():
+            self._converting = False
+            self._convert_btn.configure(state="normal", text="Convert to Dark Mode")
+            self._status_label.configure(text="Failed — see error dialog.")
+            messagebox.showerror("Conversion failed", message)
+        self.after(0, _show)
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
