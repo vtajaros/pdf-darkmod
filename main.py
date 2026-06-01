@@ -220,11 +220,15 @@ FONT_SMALL = (_ui_font,   8)
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("PDF-DarkMod")
+        self._title_base = "PDF-DarkMod"
+        self.title(self._title_base)
         self.geometry("1060x620")
         self.minsize(920, 560)
         self.configure(bg=C["bg"])
         self.resizable(True, True)
+
+        self._current_width = 0
+        self.bind("<Configure>", self._on_app_configure)
 
         # Match Tkinter's internal scaling to the actual display DPI
         try:
@@ -268,6 +272,10 @@ class App(tk.Tk):
 
         self._preview_page_index = 0   # 0-based page index currently shown in preview
         self._preview_total_pages = 0  # set when a PDF is loaded
+
+        self._zoom_mode = "fit"
+        self._zoom_custom_factor = 1.0
+        self._resize_timer = None
 
         # Triggers for preview
         self._input_var.trace_add("write", lambda *_: (
@@ -366,14 +374,14 @@ class App(tk.Tk):
 
         # --- LEFT PANEL ---
         title_frame = tk.Frame(left_pane, bg=C["bg"])
-        title_frame.pack(fill=tk.X, padx=SIDE_PAD, pady=(22, 0))
+        title_frame.pack(fill=tk.X, pady=(22, 0))
 
         tk.Label(title_frame, text="PDF-DarkMod", font=FONT_TITLE,
-                 bg=C["bg"], fg=C["text"]).pack(side=tk.LEFT)
+                 bg=C["bg"], fg=C["text"]).pack(anchor="center")
 
         tk.Label(left_pane, text="Offline Converter",
                  font=FONT_SMALL, bg=C["bg"], fg=C["muted"]
-                 ).pack(anchor="w", padx=SIDE_PAD, pady=(2, 20))
+                 ).pack(anchor="center", pady=(2, 20))
 
         # File inputs
         self._make_field(left_pane, "INPUT PDF", self._input_var, "Browse", self._browse_input).pack(
@@ -462,6 +470,33 @@ class App(tk.Tk):
         nav_frame = tk.Frame(header, bg=C["panel"])
         nav_frame.pack(side=tk.RIGHT, padx=12)
 
+        btn_zoom_out = tk.Button(
+            nav_frame, text="−", command=self._zoom_out,
+            font=FONT_LABEL, bg=C["surface"], fg=C["text2"],
+            activebackground=C["border2"], activeforeground=C["text"],
+            relief="flat", padx=6, pady=2, cursor="hand2",
+            highlightthickness=1, highlightbackground=C["border"]
+        )
+        btn_zoom_out.pack(side=tk.LEFT, padx=(0, 4))
+
+        btn_zoom_fit = tk.Button(
+            nav_frame, text="Fit", command=self._zoom_fit,
+            font=FONT_LABEL, bg=C["surface"], fg=C["text2"],
+            activebackground=C["border2"], activeforeground=C["text"],
+            relief="flat", padx=8, pady=2, cursor="hand2",
+            highlightthickness=1, highlightbackground=C["border"]
+        )
+        btn_zoom_fit.pack(side=tk.LEFT, padx=(0, 4))
+
+        btn_zoom_in = tk.Button(
+            nav_frame, text="+", command=self._zoom_in,
+            font=FONT_LABEL, bg=C["surface"], fg=C["text2"],
+            activebackground=C["border2"], activeforeground=C["text"],
+            relief="flat", padx=6, pady=2, cursor="hand2",
+            highlightthickness=1, highlightbackground=C["border"]
+        )
+        btn_zoom_in.pack(side=tk.LEFT, padx=(0, 12))
+
         btn_prev = tk.Button(
             nav_frame, text="◀", command=self._preview_prev,
             font=FONT_LABEL, bg=C["surface"], fg=C["text2"],
@@ -496,14 +531,21 @@ class App(tk.Tk):
         preview_area = tk.Frame(right_pane, bg=C["panel"])
         preview_area.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
 
-        self._preview_label = tk.Label(
-            preview_area,
-            text="Load a PDF to preview",
-            font=FONT_MONO, bg=C["surface"], fg=C["muted"],
-            relief="flat"
+        self._preview_canvas = tk.Canvas(preview_area, bg=C["surface"], highlightthickness=0)
+        self._v_scroll = ttk.Scrollbar(preview_area, orient="vertical", command=self._preview_canvas.yview)
+        self._h_scroll = ttk.Scrollbar(preview_area, orient="horizontal", command=self._preview_canvas.xview)
+        self._preview_canvas.configure(yscrollcommand=self._v_scroll.set, xscrollcommand=self._h_scroll.set)
+        
+        self._v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        self._preview_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        self._canvas_img_id = self._preview_canvas.create_image(0, 0, anchor="nw")
+        self._canvas_text_id = self._preview_canvas.create_text(
+            0, 0, text="Load a PDF to preview", 
+            font=FONT_MONO, fill=C["muted"], anchor="center"
         )
-        self._preview_label.place(relx=0.5, rely=0.5, anchor="center",
-                                   relwidth=0.85, relheight=0.95)
+        self._preview_canvas.bind("<Configure>", self._on_canvas_configure)
 
         footer = tk.Frame(right_pane, bg=C["panel"], height=32)
         footer.pack(fill=tk.X, side=tk.BOTTOM)
@@ -530,6 +572,43 @@ class App(tk.Tk):
             dot.bind("<Enter>",    lambda e, d=dot: d.configure(highlightbackground=C["text2"]))
             dot.bind("<Leave>",    lambda e, d=dot: d.configure(highlightbackground=C["border"]))
 
+
+    def _on_canvas_configure(self, event):
+        self._preview_canvas.coords(self._canvas_text_id, event.width / 2, event.height / 2)
+        if self._zoom_mode == "fit" and self._input_var.get():
+            if self._resize_timer is not None:
+                self.after_cancel(self._resize_timer)
+            self._resize_timer = self.after(300, lambda: self._render_preview(self._theme_var.get()))
+
+    def _on_app_configure(self, event):
+        if event.widget == self:
+            w = event.width
+            if w != self._current_width:
+                self._current_width = w
+                if sys.platform == "win32":
+                    title_len = len(self._title_base)
+                    # Estimate the offset needed to center the text relative to the screen width,
+                    # accounting for the window buttons (~140px) and icon (~40px).
+                    pixels_needed = ((w - 180) / 2) - ((title_len * 7) / 2)
+                    # Use Em Space (\u2003) which Windows titlebar does not strip.
+                    # An Em Space is typically ~12 pixels wide in the standard title font.
+                    spaces = max(0, int(pixels_needed / 12))
+                    self.title("\u2003" * spaces + self._title_base)
+
+    def _zoom_in(self):
+        self._zoom_mode = "custom"
+        self._zoom_custom_factor *= 1.25
+        self._render_preview(self._theme_var.get())
+
+    def _zoom_out(self):
+        self._zoom_mode = "custom"
+        self._zoom_custom_factor /= 1.25
+        self._render_preview(self._theme_var.get())
+
+    def _zoom_fit(self):
+        self._zoom_mode = "fit"
+        self._zoom_custom_factor = 1.0
+        self._render_preview(self._theme_var.get())
 
     def _on_theme_dot(self, theme_name: str) -> None:
         self._theme_var.set(theme_name)
@@ -632,7 +711,22 @@ class App(tk.Tk):
 
                 doc = fitz.open(str(input_path))
                 page = doc[page_index]
-                mat = fitz.Matrix(1.0, 1.0)  # 72 DPI — screen only
+                
+                page_rect = page.rect
+                page_w = page_rect.width
+                page_h = page_rect.height
+                
+                zoom = 1.0
+                if self._zoom_mode == "fit":
+                    canvas_w = self._preview_canvas.winfo_width()
+                    canvas_h = self._preview_canvas.winfo_height()
+                    if canvas_w > 1 and canvas_h > 1:
+                        margin = 20
+                        zoom = min((canvas_w - margin) / page_w, (canvas_h - margin) / page_h)
+                else:
+                    zoom = self._zoom_custom_factor
+
+                mat = fitz.Matrix(zoom, zoom)
                 pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csRGB)
                 doc.close()
 
@@ -670,10 +764,6 @@ class App(tk.Tk):
                 b64 = base64.b64encode(pix.tobytes("png"))
                 photo = tk.PhotoImage(data=b64)
 
-                factor_sub = max(1, photo.width() // 380)
-                if factor_sub > 1:
-                    photo = photo.subsample(factor_sub, factor_sub)
-
                 self.after(0, lambda p=photo: self._update_preview_image(p))
                 self.after(0, lambda i=page_index, t=self._preview_total_pages:
                     self._preview_page_badge.configure(
@@ -688,10 +778,23 @@ class App(tk.Tk):
 
     def _update_preview_image(self, photo) -> None:
         self._preview_photo = photo  # keep reference to prevent GC
-        self._preview_label.configure(image=photo, text="")
+        self._preview_canvas.itemconfig(self._canvas_img_id, image=photo)
+        self._preview_canvas.itemconfig(self._canvas_text_id, state="hidden")
+        
+        cw = self._preview_canvas.winfo_width()
+        ch = self._preview_canvas.winfo_height()
+        iw = photo.width()
+        ih = photo.height()
+        
+        x = max(0, (cw - iw) // 2)
+        y = max(0, (ch - ih) // 2)
+        
+        self._preview_canvas.coords(self._canvas_img_id, x, y)
+        self._preview_canvas.configure(scrollregion=(0, 0, max(cw, iw), max(ch, ih)))
 
     def _show_preview_error(self, msg: str) -> None:
-        self._preview_label.configure(image="", text=f"Preview error:\n{msg}")
+        self._preview_canvas.itemconfig(self._canvas_text_id, text=f"Preview error:\n{msg}", state="normal")
+        self._preview_canvas.itemconfig(self._canvas_img_id, image="")
 
 
     # ── Conversion ─────────────────────────────────────────────────────────────

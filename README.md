@@ -9,9 +9,10 @@ Built entirely with Python and Tkinter, ensuring 100% privacy with complete offl
 - **Standalone Desktop App:** Pure native feel, lightweight, and works fully offline.
 - **Privacy First:** Your files never leave your device.
 - **Beautiful Dark Themes:** Includes custom tailored themes like Classic Inversion, Claude Warm, ChatGPT Cool, Sepia Dark, Midnight Blue, and Forest Green.
-- **Real-Time Preview:** Instantly see how your PDF will look in different themes with the built-in fast preview panel.
+- **Interactive & Zoomable Preview:** Instantly preview your PDF page in the selected theme. Zoom in (`+`), zoom out (`−`), or scale to fit (`Fit`) with responsive scaling and dual-axis scrolling (horizontal/vertical scrollbars) to view the entire document even when minimized or deeply zoomed.
 - **Customizable Quality:** Choose between fast conversions or high-quality (up to 300 DPI) rendering using NumPy optimizations.
 - **Bookmarks Preserved:** Keeps your original PDF's table of contents and bookmarks intact.
+- **Immersive Dark UI:** Polished interface featuring centered sidebar headers and a dynamically centered window titlebar (Windows-compatible).
 
 ## Requirements
 - Python 3.10+
