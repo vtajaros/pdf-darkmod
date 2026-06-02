@@ -96,12 +96,19 @@ def convert_pdf(
         for i, page in enumerate(doc):
             t0 = time.perf_counter()
 
+            # PDF annotation flags: Print(4) | ReadOnly(64) | Locked(128) = 196
+            # Print  → annotation renders in viewers/print (keeps the dark mode effect)
+            # ReadOnly + Locked → suppresses editing UI, tooltips, and annotation
+            #                     panel entries in Sumatra and other strict viewers
+            _ANNOT_FLAGS = 4 | 64 | 128  # 196
+
             # Layer 1: Difference(white) — inverts all colors
             # white bg (255) → black (0), black text (0) → white (255)
             a1 = page.add_rect_annot(page.rect)
             a1.set_colors(stroke=None, fill=(1.0, 1.0, 1.0))
             a1.set_opacity(1.0)
             a1.set_blendmode("Difference")
+            a1.set_flags(_ANNOT_FLAGS)
             a1.update()
 
             # Layer 2: Screen(theme) — tints inverted result to theme background
@@ -110,6 +117,7 @@ def convert_pdf(
             a2.set_colors(stroke=None, fill=(r, g, b))
             a2.set_opacity(1.0)
             a2.set_blendmode("Screen")
+            a2.set_flags(_ANNOT_FLAGS)
             a2.update()
 
             page_times.append(time.perf_counter() - t0)
